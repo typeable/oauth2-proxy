@@ -6,6 +6,7 @@ import (
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	sessionsapi "github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/sessions"
+	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/util/ptr"
 )
 
 // TokenToSessionFunc takes a raw ID Token and converts it into a SessionState.
@@ -20,10 +21,11 @@ type VerifyFunc func(ctx context.Context, token string) (*oidc.IDToken, error)
 func CreateTokenToSessionFunc(verify VerifyFunc) TokenToSessionFunc {
 	return func(ctx context.Context, token string) (*sessionsapi.SessionState, error) {
 		var claims struct {
-			Subject           string `json:"sub"`
-			Email             string `json:"email"`
-			Verified          *bool  `json:"email_verified"`
-			PreferredUsername string `json:"preferred_username"`
+			Subject           string   `json:"sub"`
+			Email             string   `json:"email"`
+			Verified          *bool    `json:"email_verified"`
+			PreferredUsername string   `json:"preferred_username"`
+			Groups            []string `json:"groups"`
 		}
 
 		idToken, err := verify(ctx, token)
@@ -39,13 +41,17 @@ func CreateTokenToSessionFunc(verify VerifyFunc) TokenToSessionFunc {
 			claims.Email = claims.Subject
 		}
 
-		if claims.Verified != nil && !*claims.Verified {
+		// Ensure email is verified
+		// If the email is not verified, return an error
+		// If the email_verified claim is missing, assume it is verified
+		if !ptr.Deref(claims.Verified, true) {
 			return nil, fmt.Errorf("email in id_token (%s) isn't verified", claims.Email)
 		}
 
 		newSession := &sessionsapi.SessionState{
 			Email:             claims.Email,
 			User:              claims.Subject,
+			Groups:            claims.Groups,
 			PreferredUsername: claims.PreferredUsername,
 			AccessToken:       token,
 			IDToken:           token,
