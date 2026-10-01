@@ -169,6 +169,9 @@ const (
 	// DigitalOceanProvider is the provider type for DigitalOcean
 	DigitalOceanProvider ProviderType = "digitalocean"
 
+	// DTTSSOProvider is the provider type for the DTT SSO
+	DTTSSOProvider ProviderType = "dtt-sso"
+
 	// FacebookProvider is the provider type for Facebook
 	FacebookProvider ProviderType = "facebook"
 
