@@ -9,7 +9,7 @@ import (
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/requests"
 )
 
-// AtlassianProvider represents an Atlassian based Identity Provider
+// AtlassianProvider represents an Atlassian Cloud based Identity Provider
 type AtlassianProvider struct {
 	*ProviderData
 }
@@ -24,27 +24,20 @@ const (
 )
 
 var (
-	// Default Login URL for Atlassian.
-	// Pre-parsed URL of https://atlassian.org/site/oauth2/authorize.
 	atlassianDefaultLoginURL = &url.URL{
 		Scheme: "https",
 		Host:   "auth.atlassian.com",
 		Path:   "/authorize",
 	}
 
-	// Default Redeem URL for Atlassian.
-	// Pre-parsed URL of https://atlassian.org/site/oauth2/access_token.
 	atlassianDefaultRedeemURL = &url.URL{
 		Scheme: "https",
 		Host:   "auth.atlassian.com",
 		Path:   "/oauth/token",
 	}
 
-	// Default Validation URL for Atlassian.
-	// This simply returns the email of the authenticated user.
-	// Atlassian does not have a Profile URL to use.
-	// Pre-parsed URL of https://api.atlassian.org/2.0/user/emails.
-	atlassianDefaultValidateURL = &url.URL{
+	// atlassianDefaultProfileURL returns the signed-in user's profile.
+	atlassianDefaultProfileURL = &url.URL{
 		Scheme: "https",
 		Host:   "api.atlassian.com",
 		Path:   "/me",
@@ -57,37 +50,50 @@ func NewAtlassianProvider(p *ProviderData) *AtlassianProvider {
 		name:        atlassianProviderName,
 		loginURL:    atlassianDefaultLoginURL,
 		redeemURL:   atlassianDefaultRedeemURL,
-		profileURL:  nil,
-		validateURL: atlassianDefaultValidateURL,
+		profileURL:  atlassianDefaultProfileURL,
+		validateURL: atlassianDefaultProfileURL,
 		scope:       atlassianDefaultScope,
 	})
-	p.Prompt = atlassianPrompt
 	return &AtlassianProvider{ProviderData: p}
 }
-func (p *AtlassianProvider) GetLoginURL(redirectURI, state, _ string) string {
-	extraParams := url.Values{}
-	extraParams.Add("audience", atlassianAudience)
-	loginURL := makeLoginURL(p.ProviderData, redirectURI, state, extraParams)
+
+// GetLoginURL adds the audience and prompt parameters Atlassian requires.
+func (p *AtlassianProvider) GetLoginURL(redirectURI, state, _ string, extraParams url.Values) string {
+	params := url.Values{}
+	for k, v := range extraParams {
+		params[k] = v
+	}
+	params.Del("approval_prompt")
+	if params.Get("prompt") == "" {
+		params.Set("prompt", atlassianPrompt)
+	}
+	params.Set("audience", atlassianAudience)
+
+	loginURL := makeLoginURL(p.ProviderData, redirectURI, state, params)
 	return loginURL.String()
 }
-func (p *AtlassianProvider) ValidateSession(ctx context.Context, s *sessions.SessionState) bool {
-	return validateToken(ctx, p, s.AccessToken, makeOIDCHeader(s.AccessToken))
-}
-func (p *AtlassianProvider) GetEmailAddress(ctx context.Context, s *sessions.SessionState) (string, error) {
-	type meEmail struct {
+
+// EnrichSession sets the session's email from the Atlassian profile.
+func (p *AtlassianProvider) EnrichSession(ctx context.Context, s *sessions.SessionState) error {
+	var profile struct {
 		Email string `json:"email"`
 	}
-	var email meEmail
-	err := requests.New(atlassianDefaultValidateURL.String()).
+	err := requests.New(p.ProfileURL.String()).
 		WithContext(ctx).
 		WithHeaders(makeOIDCHeader(s.AccessToken)).
 		Do().
-		UnmarshalInto(&email)
+		UnmarshalInto(&profile)
 	if err != nil {
-		return "", err
+		return err
 	}
-	if email.Email == "" {
-		return "", errors.New("no email in respose")
+	if profile.Email == "" {
+		return errors.New("no email in Atlassian profile")
 	}
-	return email.Email, nil
+	s.Email = profile.Email
+	return nil
+}
+
+// ValidateSession validates the AccessToken
+func (p *AtlassianProvider) ValidateSession(ctx context.Context, s *sessions.SessionState) bool {
+	return validateToken(ctx, p, s.AccessToken, makeOIDCHeader(s.AccessToken))
 }

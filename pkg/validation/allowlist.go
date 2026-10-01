@@ -11,10 +11,12 @@ import (
 )
 
 func validateAllowlists(o *options.Options) []string {
+	//nolint:prealloc
 	msgs := []string{}
 
-	msgs = append(msgs, validateRoutes(o)...)
-	msgs = append(msgs, validateRegexes(o)...)
+	msgs = append(msgs, validateAuthRoutes(o)...)
+	msgs = append(msgs, validateAuthRegexes(o)...)
+	msgs = append(msgs, validateTrustedProxyIPs(o)...)
 	msgs = append(msgs, validateTrustedIPs(o)...)
 
 	if len(o.TrustedIPs) > 0 && o.ReverseProxy {
@@ -27,8 +29,19 @@ func validateAllowlists(o *options.Options) []string {
 	return msgs
 }
 
-// validateRoutes validates method=path routes passed with options.SkipAuthRoutes
-func validateRoutes(o *options.Options) []string {
+// validateTrustedProxyIPs validates IP/CIDRs for trusted reverse proxies.
+func validateTrustedProxyIPs(o *options.Options) []string {
+	msgs := []string{}
+	for i, ipStr := range o.TrustedProxyIPs {
+		if ip.ParseIPNet(ipStr) == nil {
+			msgs = append(msgs, fmt.Sprintf("trusted_proxy_ips[%d] (%s) could not be recognized", i, ipStr))
+		}
+	}
+	return msgs
+}
+
+// validateAuthRoutes validates method=path routes passed with options.SkipAuthRoutes
+func validateAuthRoutes(o *options.Options) []string {
 	msgs := []string{}
 	for _, route := range o.SkipAuthRoutes {
 		var regex string
@@ -46,16 +59,9 @@ func validateRoutes(o *options.Options) []string {
 	return msgs
 }
 
-// validateRegex validates regex paths passed with options.SkipAuthRegex
-func validateRegexes(o *options.Options) []string {
-	msgs := []string{}
-	for _, regex := range o.SkipAuthRegex {
-		_, err := regexp.Compile(regex)
-		if err != nil {
-			msgs = append(msgs, fmt.Sprintf("error compiling regex /%s/: %v", regex, err))
-		}
-	}
-	return msgs
+// validateAuthRegexes validates regex paths passed with options.SkipAuthRegex
+func validateAuthRegexes(o *options.Options) []string {
+	return validateRegexes(o.SkipAuthRegex)
 }
 
 // validateTrustedIPs validates IP/CIDRs for IP based allowlists
@@ -64,6 +70,23 @@ func validateTrustedIPs(o *options.Options) []string {
 	for i, ipStr := range o.TrustedIPs {
 		if nil == ip.ParseIPNet(ipStr) {
 			msgs = append(msgs, fmt.Sprintf("trusted_ips[%d] (%s) could not be recognized", i, ipStr))
+		}
+	}
+	return msgs
+}
+
+// validateAPIRoutes validates regex paths passed with options.ApiRoutes
+func validateAPIRoutes(o *options.Options) []string {
+	return validateRegexes(o.APIRoutes)
+}
+
+// validateRegexes validates all regexes and returns a list of messages in case of error
+func validateRegexes(regexes []string) []string {
+	msgs := []string{}
+	for _, regex := range regexes {
+		_, err := regexp.Compile(regex)
+		if err != nil {
+			msgs = append(msgs, fmt.Sprintf("error compiling regex /%s/: %v", regex, err))
 		}
 	}
 	return msgs

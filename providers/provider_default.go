@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/middleware"
@@ -33,14 +34,21 @@ var (
 )
 
 // GetLoginURL with typical oauth parameters
-func (p *ProviderData) GetLoginURL(redirectURI, state, _ string) string {
-	extraParams := url.Values{}
+// codeChallenge and codeChallengeMethod are the PKCE challenge and method to append to the URL params.
+// they will be empty strings if no code challenge should be presented
+func (p *ProviderData) GetLoginURL(redirectURI, state, _ string, extraParams url.Values) string {
+	// Response mode should only be set if a non default mode is requested
+	if p.AuthRequestResponseMode != "" {
+		extraParams.Add("response_mode", p.AuthRequestResponseMode)
+	}
+
 	loginURL := makeLoginURL(p, redirectURI, state, extraParams)
 	return loginURL.String()
 }
 
 // Redeem provides a default implementation of the OAuth2 token redemption process
-func (p *ProviderData) Redeem(ctx context.Context, redirectURL, code string) (*sessions.SessionState, error) {
+// The codeVerifier is set if a code_verifier parameter should be sent for PKCE
+func (p *ProviderData) Redeem(ctx context.Context, redirectURL, code, codeVerifier string) (*sessions.SessionState, error) {
 	if code == "" {
 		return nil, ErrMissingCode
 	}
@@ -55,13 +63,16 @@ func (p *ProviderData) Redeem(ctx context.Context, redirectURL, code string) (*s
 	params.Add("client_secret", clientSecret)
 	params.Add("code", code)
 	params.Add("grant_type", "authorization_code")
+	if codeVerifier != "" {
+		params.Add("code_verifier", codeVerifier)
+	}
 	if p.ProtectedResource != nil && p.ProtectedResource.String() != "" {
 		params.Add("resource", p.ProtectedResource.String())
 	}
 
 	result := requests.New(p.RedeemURL.String()).
 		WithContext(ctx).
-		WithMethod("POST").
+		WithMethod(http.MethodPost).
 		WithBody(bytes.NewBufferString(params.Encode())).
 		SetHeader("Content-Type", "application/x-www-form-urlencoded").
 		Do()
@@ -97,6 +108,7 @@ func (p *ProviderData) Redeem(ctx context.Context, redirectURL, code string) (*s
 }
 
 // GetEmailAddress returns the Account email address
+//
 // Deprecated: Migrate to EnrichSession
 func (p *ProviderData) GetEmailAddress(_ context.Context, _ *sessions.SessionState) (string, error) {
 	return "", ErrNotImplemented

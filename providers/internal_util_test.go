@@ -26,13 +26,13 @@ type ValidateSessionTestProvider struct {
 
 var _ Provider = (*ValidateSessionTestProvider)(nil)
 
-func (tp *ValidateSessionTestProvider) GetEmailAddress(ctx context.Context, s *sessions.SessionState) (string, error) {
+func (tp *ValidateSessionTestProvider) GetEmailAddress(_ context.Context, _ *sessions.SessionState) (string, error) {
 	return "", errors.New("not implemented")
 }
 
 // Note that we're testing the internal validateToken() used to implement
 // several Provider's ValidateSession() implementations
-func (tp *ValidateSessionTestProvider) ValidateSession(ctx context.Context, s *sessions.SessionState) bool {
+func (tp *ValidateSessionTestProvider) ValidateSession(_ context.Context, _ *sessions.SessionState) bool {
 	return false
 }
 
@@ -132,6 +132,13 @@ func TestValidateSessionExpiredToken(t *testing.T) {
 	assert.Equal(t, false, validateToken(context.Background(), vtTest.provider, "foobar", nil))
 }
 
+func TestValidateSessionValidateURLWithQueryParams(t *testing.T) {
+	vtTest := NewValidateSessionTest()
+	defer vtTest.Close()
+	vtTest.provider.Data().ValidateURL, _ = url.Parse(vtTest.provider.Data().ValidateURL.String() + "?query_param1=true&query_param2=test")
+	assert.Equal(t, true, validateToken(context.Background(), vtTest.provider, "foobar", nil))
+}
+
 func TestStripTokenNotPresent(t *testing.T) {
 	test := "http://local.test/api/test?a=1&b=2"
 	assert.Equal(t, test, stripToken(test))
@@ -140,5 +147,11 @@ func TestStripTokenNotPresent(t *testing.T) {
 func TestStripToken(t *testing.T) {
 	test := "http://local.test/api/test?access_token=deadbeef&b=1&c=2"
 	expected := "http://local.test/api/test?access_token=dead...&b=1&c=2"
+	assert.Equal(t, expected, stripToken(test))
+}
+
+func TestStripLongToken(t *testing.T) {
+	test := "http://local.test/api/test?access_token=deadbeefwithsupersecret&b=1&c=2"
+	expected := "http://local.test/api/test?access_token=deadb...&b=1&c=2"
 	assert.Equal(t, expected, stripToken(test))
 }

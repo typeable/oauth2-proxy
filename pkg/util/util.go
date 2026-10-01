@@ -5,21 +5,55 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"math/big"
 	"net"
+	"net/url"
+	"os"
+	"strings"
 	"time"
+
+	"github.com/spf13/cast"
 )
 
-func GetCertPool(paths []string) (*x509.CertPool, error) {
+func GetCertPool(paths []string, useSystemPool bool) (*x509.CertPool, error) {
 	if len(paths) == 0 {
 		return nil, fmt.Errorf("invalid empty list of Root CAs file paths")
 	}
-	pool := x509.NewCertPool()
+
+	var pool *x509.CertPool
+	if useSystemPool {
+		rootPool, err := getSystemCertPool()
+		if err != nil {
+			return nil, fmt.Errorf("unable to get SystemCertPool when append is true - #{err}")
+		}
+		pool = rootPool
+	} else {
+		pool = x509.NewCertPool()
+	}
+
+	return loadCertsFromPaths(paths, pool)
+
+}
+
+func getSystemCertPool() (*x509.CertPool, error) {
+	rootPool, err := x509.SystemCertPool()
+	if err != nil {
+		return nil, err
+	}
+
+	if rootPool == nil {
+		return nil, fmt.Errorf("SystemCertPool is empty")
+	}
+
+	return rootPool, nil
+}
+
+func loadCertsFromPaths(paths []string, pool *x509.CertPool) (*x509.CertPool, error) {
 	for _, path := range paths {
 		// Cert paths are a configurable option
-		data, err := ioutil.ReadFile(path) // #nosec G304
+		data, err := os.ReadFile(path) // #nosec G304
 		if err != nil {
 			return nil, fmt.Errorf("certificate authority file (%s) could not be read - %s", path, err)
 		}
@@ -31,7 +65,7 @@ func GetCertPool(paths []string) (*x509.CertPool, error) {
 }
 
 // https://golang.org/src/crypto/tls/generate_cert.go as a function
-func GenerateCert() ([]byte, []byte, error) {
+func GenerateCert(ipaddr string) ([]byte, []byte, error) {
 	var err error
 
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -61,8 +95,163 @@ func GenerateCert() ([]byte, []byte, error) {
 
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 
-		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")},
+		IPAddresses: []net.IP{net.ParseIP(ipaddr)},
 	}
 	certBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
 	return certBytes, keyBytes, err
+}
+
+// SplitHostPort separates host and port. If the port is not valid, it returns
+// the entire input as host, and it doesn't check the validity of the host.
+// Unlike net.SplitHostPort, but per RFC 3986, it requires ports to be numeric.
+// *** taken from net/url, modified validOptionalPort() to accept ":*"
+func SplitHostPort(hostport string) (host, port string) {
+	host = hostport
+
+	colon := strings.LastIndexByte(host, ':')
+	if colon != -1 && validOptionalPort(host[colon:]) {
+		host, port = host[:colon], host[colon+1:]
+	}
+
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+
+	return
+}
+
+// validOptionalPort reports whether port is either an empty string
+// or matches /^:\d*$/
+// *** taken from net/url, modified to accept ":*"
+func validOptionalPort(port string) bool {
+	if port == "" || port == ":*" {
+		return true
+	}
+	if port[0] != ':' {
+		return false
+	}
+	for _, b := range port[1:] {
+		if b < '0' || b > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// IsEndpointAllowed checks whether the endpoint URL is allowed based
+// on an allowed domains list.
+func IsEndpointAllowed(endpoint *url.URL, allowedDomains []string) bool {
+	hostname := endpoint.Hostname()
+
+	for _, allowedDomain := range allowedDomains {
+		allowedHost, allowedPort := SplitHostPort(allowedDomain)
+		if allowedHost == "" {
+			continue
+		}
+
+		if isHostnameAllowed(hostname, allowedHost) {
+			// the domain names match, now validate the ports
+			// if the allowed domain's port is '*', allow all ports
+			// if the allowed domain contains a specific port, only allow that port
+			// if the allowed domain doesn't contain a port at all, only allow empty redirect ports ie http and https
+			redirectPort := endpoint.Port()
+			if allowedPort == "*" ||
+				allowedPort == redirectPort ||
+				(allowedPort == "" && redirectPort == "") {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func isHostnameAllowed(hostname, allowedHost string) bool {
+	// check if we have a perfect match between hostname and allowedHost
+	if hostname == strings.TrimPrefix(allowedHost, ".") ||
+		hostname == strings.TrimPrefix(allowedHost, "*.") {
+		return true
+	}
+
+	// check if hostname is a sub domain of the allowedHost
+	if (strings.HasPrefix(allowedHost, ".") && strings.HasSuffix(hostname, allowedHost)) ||
+		(strings.HasPrefix(allowedHost, "*.") && strings.HasSuffix(hostname, allowedHost[1:])) {
+		return true
+	}
+
+	return false
+}
+
+// RemoveDuplicateStr removes duplicates from a slice of strings.
+func RemoveDuplicateStr(strSlice []string) []string {
+	allKeys := make(map[string]struct{})
+	var list []string
+	for _, item := range strSlice {
+		if _, ok := allKeys[item]; !ok {
+			allKeys[item] = struct{}{}
+			list = append(list, item)
+		}
+	}
+	return list
+}
+
+// CoerceClaim tries to convert the value into the destination interface type.
+// If it can convert the value, it will then store the value in the destination
+// interface.
+func CoerceClaim(value, dst any) error {
+	switch d := dst.(type) {
+	case *string:
+		str, err := toString(value)
+		if err != nil {
+			return fmt.Errorf("could not convert value to string: %v", err)
+		}
+		*d = str
+	case *[]string:
+		strSlice, err := toStringSlice(value)
+		if err != nil {
+			return fmt.Errorf("could not convert value to string slice: %v", err)
+		}
+		*d = strSlice
+	case *bool:
+		*d = cast.ToBool(value)
+	default:
+		return fmt.Errorf("unknown type for destination: %T", dst)
+	}
+	return nil
+}
+
+// toStringSlice converts an interface (either a slice or single value) into
+// a slice of strings.
+func toStringSlice(value any) ([]string, error) {
+	var sliceValues []any
+	switch v := value.(type) {
+	case []any:
+		sliceValues = v
+	default:
+		sliceValues = []any{v}
+	}
+
+	out := []string{}
+	for _, v := range sliceValues {
+		str, err := toString(v)
+		if err != nil {
+			return nil, fmt.Errorf("could not convert slice entry to string %v: %v", v, err)
+		}
+		out = append(out, str)
+	}
+	return out, nil
+}
+
+// toString coerces a value into a string.
+// If it is non-string, marshal it into JSON.
+func toString(value any) (string, error) {
+	if str, err := cast.ToStringE(value); err == nil {
+		return str, nil
+	}
+
+	jsonStr, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	return string(jsonStr), nil
 }

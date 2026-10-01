@@ -13,7 +13,12 @@ func GetRealClientIPParser(headerKey string) (ipapi.RealClientIPParser, error) {
 	headerKey = http.CanonicalHeaderKey(headerKey)
 
 	switch headerKey {
-	case http.CanonicalHeaderKey("X-Forwarded-For"), http.CanonicalHeaderKey("X-Real-IP"), http.CanonicalHeaderKey("X-ProxyUser-IP"):
+	case http.CanonicalHeaderKey("X-Forwarded-For"),
+		http.CanonicalHeaderKey("X-Real-IP"),
+		http.CanonicalHeaderKey("X-ProxyUser-IP"),
+		http.CanonicalHeaderKey("X-Envoy-External-Address"),
+		// Cloudflare specific Real-IP header
+		http.CanonicalHeaderKey("CF-Connecting-IP"):
 		return &xForwardedForClientIPParser{header: headerKey}, nil
 	}
 
@@ -68,6 +73,13 @@ func GetClientIP(p ipapi.RealClientIPParser, req *http.Request) (net.IP, error) 
 
 // getRemoteIP obtains the IP of the low-level connected network host
 func getRemoteIP(req *http.Request) (net.IP, error) {
+	// Unix domain sockets set RemoteAddr to "@" which has no meaningful IP.
+	// https://github.com/golang/go/blob/0fa53e41f122b1661d0678a6d36d71b7b5ad031d/src/syscall/syscall_linux.go#L506-L511
+	if req.RemoteAddr == "@" {
+		return nil, nil
+	}
+
+	//revive:disable:indent-error-flow
 	if ipStr, _, err := net.SplitHostPort(req.RemoteAddr); err != nil {
 		return nil, fmt.Errorf("unable to get ip and port from http.RemoteAddr (%s)", req.RemoteAddr)
 	} else if ip := net.ParseIP(ipStr); ip != nil {
@@ -75,6 +87,7 @@ func getRemoteIP(req *http.Request) (net.IP, error) {
 	} else {
 		return nil, fmt.Errorf("unable to parse ip (%s)", ipStr)
 	}
+	//revive:enable:indent-error-flow
 }
 
 // GetClientString obtains the human readable string of the remote IP and optionally the real client IP if available
@@ -87,7 +100,7 @@ func GetClientString(p ipapi.RealClientIPParser, req *http.Request, full bool) (
 	}
 
 	var remoteIPStr string
-	if remoteIP, err := getRemoteIP(req); err == nil {
+	if remoteIP, err := getRemoteIP(req); err == nil && remoteIP != nil {
 		remoteIPStr = remoteIP.String()
 	}
 

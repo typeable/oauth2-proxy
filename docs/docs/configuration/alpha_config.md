@@ -23,17 +23,56 @@ When using alpha configuration, your config file will look something like below:
 ```yaml
 upstreams:
   - id: ...
-    ...
+    ...: ...
+providers:
+  - id: ...
+    ...: ...
+cookie:
+  secret: ...
+  ...: ...
 injectRequestHeaders:
-  - name: ...
-    ...
+  - secretSource:
+      ...: ...
 injectResponseHeaders:
-  - name: ...
-    ...
+  - claimSource:
+      ...: ...
 ```
 
 Please browse the [reference](#configuration-reference) below for the structure
 of the new configuration format.
+
+# Migration Guide
+
+This section details breaking changes and migration steps for moving to the new
+alpha configuration format.
+
+## Migrating header injections in v7.14.0
+
+From v7.14.0 onward, header injection sources must be explicitly nested. If you
+previously relied on squashed fields, update to the new structure before
+upgrading:
+
+```yaml
+# before v7.14.0
+injectRequestHeaders:
+- name: X-Forwarded-User
+  values:
+  - claim: user
+- name: X-Custom-Secret-header
+  values:
+  - value: my-super-secret
+
+# v7.14.0 and later
+injectRequestHeaders:
+- name: X-Forwarded-User
+  values:
+  - claimSource:
+      claim: user
+- name: X-Custom-Secret-header
+  values:
+  - secretSource:
+      value: my-super-secret
+```
 
 ## Using Alpha Configuration
 
@@ -67,6 +106,134 @@ the new config.
 oauth2-proxy --alpha-config ./path/to/new/config.yaml --config ./path/to/existing/config.cfg
 ```
 
+### Validating Alpha Configuration
+
+Use `--config-test` to validate your alpha configuration without starting the proxy:
+
+```bash
+oauth2-proxy --config core.cfg --alpha-config alpha.yaml --config-test
+```
+
+This is useful for CI/CD pipelines to catch configuration errors before deployment.
+See the [Configuration Validation](./overview.md#configuration-validation) section for more details.
+
+### How to use environment variables
+
+The alpha package supports the use of environment variables in place of yaml values, allowing sensitive data to be pulled from somewhere other than the yaml file.
+When using environment variables, your yaml will look like this:
+
+```yaml
+    providers:
+    - provider: azure
+      clientSecret: ${CLIENT_SECRET}
+      ...
+```
+Where CLIENT_SECRET is an environment variable.
+More information and available patterns can be found [here](https://github.com/a8m/envsubst#docs)
+
+### How to inject custom headers
+
+Configure `injectRequestHeaders` and `injectResponseHeaders` in alpha config YAML.
+
+```yaml
+injectRequestHeaders:
+  - name: "X-User-Email"
+    values:
+      - claimSource:
+          claim: "email" # extract the email claim contents from the id token
+  - name: "X-Static-Secret"
+    values:
+      # secrets need to be encoded with base64 when directly in the yaml config but will be send decoded
+      - secretSource:
+          value: "c3VwZXItc2VjcmV0"
+  - name: "X-Static-File-Secret"
+      - secretSource:
+          fromFile: "/path/to/my/secret"
+  - name: "X-Static-Env-Secret"
+      - secretSource:
+          value: "${MY_SECRET_ENV}" # content still needs to be base64 encoded
+injectResponseHeaders:
+  # Following will result in a header "Authorization: Basic <user:password> (encoded)"
+  - name: "Authorization"
+    values:
+    - claimSource:
+        claim: user
+        prefix: "Basic "
+        basicAuthPassword:
+          value: c3VwZXItc2VjcmV0LXBhc3N3b3Jk # base64 encoded password
+```
+
+**Value sources:** 
+* `claimSource` - `claim` (session claims either from id token or from profile URL)
+* `secretSource` - `value` (base64), `fromFile` (file path)
+
+#### Claim value serialization
+
+`claimSource` converts the selected claim into one or more string header values. Scalars
+produce one value, while arrays produce one value per element. Values that cannot be
+converted directly to strings, such as objects, are JSON-encoded individually.
+
+Each non-empty value is added separately under the configured header name. An array of
+objects therefore produces multiple header values containing one JSON object each, not a
+single JSON array. HTTP libraries and intermediaries may expose repeated values as a
+comma-joined string, so consumers should retrieve and parse each header value separately.
+
+**Request option:** `preserveRequestValue: true` retains existing header values
+
+**Incompatibility:** Remove legacy flags `pass-user-headers`, `set-xauthrequest`
+
+### How to utilize arbitrary claims provided by your Identity Provider
+
+With the additionalClaims attribute you can specify which claims you want to extract
+from the ID Token or userinfo (ProfileURL) endpoint.
+
+Configure these on the relevant provider entry:
+
+```yaml
+providers:
+  - id: my-oidc-provider
+    provider: oidc
+    clientID: ${OAUTH_CLIENT_ID}
+    clientSecret: ${OAUTH_CLIENT_SECRET}
+    oidcConfig:
+      issuerURL: https://issuer.example.com
+    profileURL: https://issuer.example.com/oauth2/userinfo
+    additionalClaims:
+      - department
+      - employee_id
+      - organization.name
+```
+
+OAuth2 Proxy resolves each configured claim using the following order:
+
+1. The raw ID token is checked first.
+2. If the claim is not present there and `profileURL` is configured, the userinfo endpoint is queried.
+3. If `skipClaimsFromProfileURL: true` is set, only the ID token is used.
+
+Claims that are not found are ignored rather than causing authentication to fail.
+
+You can use dot-separated paths for nested JSON objects, for example `organization.name`.
+Array indexes are not supported.
+
+Once loaded, these claims are stored in the session as `additionalClaims`. They can then be
+used anywhere session claims are accepted, including header injection:
+
+```yaml
+injectRequestHeaders:
+  - name: X-Department
+    values:
+      - claimSource:
+          claim: department
+  - name: X-Organization
+    values:
+      - claimSource:
+          claim: organization.name
+```
+
+This is useful when your IdP exposes application-specific attributes such as department,
+tenant, employee ID, entitlement, or other custom claims that are not part of the default
+OAuth2 Proxy session fields.
+
 ## Removed options
 
 The following flags/options and their respective environment variables are no
@@ -91,7 +258,31 @@ longer available when using alpha configuration:
 - `basic-auth-password`/`basic_auth_password`
 - `skip-auth-strip-headers`/`skip_auth_strip_headers`
 
-Attempting to use these options via flags or via config when `--alpha-config`
+<!-- Legacy provider FlagSet -->
+- `client-id`/`client_id`
+- `client-secret`/`client_secret`, and `client-secret-file`/`client_secret_file`
+- `provider`
+- `provider-display-name`/`provider_display_name`
+- `provider-ca-file`/`provider_ca_files`
+- `login-url`/`login_url`
+- `redeem-url`/`redeem_url`
+- `profile-url`/`profile_url`
+- `resource`
+- `validate-url`/`validate_url`
+- `scope`
+- `prompt`
+- `approval-prompt`/`approval_prompt`
+- `acr-values`/`acr_values`
+- `user-id-claim`/`user_id_claim`
+- `allowed-group`/`allowed_groups`
+- `allowed-role`/`allowed_roles`
+- `jwt-key`/`jwt_key`
+- `jwt-key-file`/`jwt_key_file`
+- `pubjwk-url`/`pubjwk_url`
+
+and all provider-specific options, i.e. any option whose name includes `oidc`,
+`azure`, `bitbucket`, `github`, `gitlab`, `google` or `keycloak`.  Attempting to
+use any of these options via flags or via config when `--alpha-config` is
 set will result in an error.
 
 :::important
@@ -99,6 +290,7 @@ You must remove these options before starting OAuth2 Proxy with `--alpha-config`
 :::
 
 ## Configuration Reference
+
 <!--- THIS FILE IS AUTOGENERATED!!! DO NOT EDIT!!! -->
 
 ### ADFSOptions
@@ -129,7 +321,7 @@ They may change between releases without notice.
 | `injectResponseHeaders` | _[[]Header](#header)_ | InjectResponseHeaders is used to configure headers that should be added<br/>to responses from the proxy.<br/>This is typically used when using the proxy as an external authentication<br/>provider in conjunction with another proxy such as NGINX and its<br/>auth_request module.<br/>Headers may source values from either the authenticated user's session<br/>or from a static secret value. |
 | `server` | _[Server](#server)_ | Server is used to configure the HTTP(S) server for the proxy application.<br/>You may choose to run both HTTP and HTTPS servers simultaneously.<br/>This can be done by setting the BindAddress and the SecureBindAddress simultaneously.<br/>To use the secure server you must configure a TLS certificate and key. |
 | `metricsServer` | _[Server](#server)_ | MetricsServer is used to configure the HTTP(S) server for metrics.<br/>You may choose to run both HTTP and HTTPS servers simultaneously.<br/>This can be done by setting the BindAddress and the SecureBindAddress simultaneously.<br/>To use the secure server you must configure a TLS certificate and key. |
-| `providers` | _[Providers](#providers)_ | Providers is used to configure multiple providers. |
+| `providers` | _[Providers](#providers)_ | Providers is used to configure your provider. **Multiple-providers is not<br/>yet working.** [This feature is tracked in<br/>#925](https://github.com/oauth2-proxy/oauth2-proxy/issues/926) |
 
 ### AzureOptions
 
@@ -140,6 +332,7 @@ They may change between releases without notice.
 | Field | Type | Description |
 | ----- | ---- | ----------- |
 | `tenant` | _string_ | Tenant directs to a tenant-specific or common (tenant-independent) endpoint<br/>Default value is 'common' |
+| `graphGroupField` | _string_ | GraphGroupField configures the group field to be used when building the groups list from Microsoft Graph<br/>Default value is 'id' |
 
 ### BitbucketOptions
 
@@ -160,20 +353,9 @@ ClaimSource allows loading a header value from a claim within the session
 
 | Field | Type | Description |
 | ----- | ---- | ----------- |
-| `claim` | _string_ | Claim is the name of the claim in the session that the value should be<br/>loaded from. |
+| `claim` | _string_ | Claim is the name of the claim in the session that the value should be<br/>loaded from. Available claims: `access_token` `id_token` `created_at`<br/>`expires_on` `refresh_token` `email` `user` `groups` `preferred_username`. |
 | `prefix` | _string_ | Prefix is an optional prefix that will be prepended to the value of the<br/>claim if it is non-empty. |
 | `basicAuthPassword` | _[SecretSource](#secretsource)_ | BasicAuthPassword converts this claim into a basic auth header.<br/>Note the value of claim will become the basic auth username and the<br/>basicAuthPassword will be used as the password value. |
-
-### Duration
-#### (`string` alias)
-
-(**Appears on:** [Upstream](#upstream))
-
-Duration is as string representation of a period of time.
-A duration string is a is a possibly signed sequence of decimal numbers,
-each with optional fraction and a unit suffix, such as "300ms", "-1.5h" or "2h45m".
-Valid time units are "ns", "us" (or "µs"), "ms", "s", "m", "h".
-
 
 ### GitHubOptions
 
@@ -198,7 +380,7 @@ Valid time units are "ns", "us" (or "µs"), "ms", "s", "m", "h".
 | Field | Type | Description |
 | ----- | ---- | ----------- |
 | `group` | _[]string_ | Group sets restrict logins to members of this group |
-| `projects` | _[]string_ | Projects restricts logins to members of any of these projects |
+| `projects` | _[]string_ | Projects restricts logins to members of these projects |
 
 ### GoogleOptions
 
@@ -208,9 +390,13 @@ Valid time units are "ns", "us" (or "µs"), "ms", "s", "m", "h".
 
 | Field | Type | Description |
 | ----- | ---- | ----------- |
-| `group` | _[]string_ | Groups sets restrict logins to members of this google group |
-| `adminEmail` | _string_ | AdminEmail is the google admin to impersonate for api calls |
+| `group` | _[]string_ | Groups sets restrict logins to members of this Google group |
+| `adminEmail` | _string_ | AdminEmail is the Google admin to impersonate for api calls |
 | `serviceAccountJson` | _string_ | ServiceAccountJSON is the path to the service account json credentials |
+| `useApplicationDefaultCredentials` | _bool_ | UseApplicationDefaultCredentials is a boolean whether to use Application Default Credentials instead of a ServiceAccountJSON |
+| `targetPrincipal` | _string_ | TargetPrincipal is the Google Service Account used for Application Default Credentials |
+| `useOrganizationID` | _bool_ | UseOrganizationId indicates whether to use the organization ID as the UserName claim |
+| `adminAPIUserScope` | _string_ | admin scope needed for fetching user organization information from admin api, can be one of cloud, user or defaults to readonly |
 
 ### Header
 
@@ -223,6 +409,7 @@ response header.
 | ----- | ---- | ----------- |
 | `name` | _string_ | Name is the header name to be used for this set of values.<br/>Names should be unique within a list of Headers. |
 | `preserveRequestValue` | _bool_ | PreserveRequestValue determines whether any values for this header<br/>should be preserved for the request to the upstream server.<br/>This option only applies to injected request headers.<br/>Defaults to false (headers that match this header will be stripped). |
+| `InsecureSkipHeaderNormalization` | _bool_ | InsecureSkipHeaderNormalization disables normalizing the header name<br/>According to RFC 7230 Section 3.2 there aren't any rules about<br/>capitalization of header names, but the standard practice is to use<br/>Title-Case (e.g. X-Forwarded-For). By default, header names will be<br/>normalized to Title-Case and any incoming headers that match will be<br/>treated as the same header. Additionally underscores (_) in header names<br/>will be converted to dashes (-) when normalizing.<br/>Defaults to false (header names will be normalized). |
 | `values` | _[[]HeaderValue](#headervalue)_ | Values contains the desired values for this header |
 
 ### HeaderValue
@@ -237,7 +424,7 @@ make up the header value
 | `value` | _[]byte_ | Value expects a base64 encoded string value. |
 | `fromEnv` | _string_ | FromEnv expects the name of an environment variable. |
 | `fromFile` | _string_ | FromFile expects a path to a file containing the secret value. |
-| `claim` | _string_ | Claim is the name of the claim in the session that the value should be<br/>loaded from. |
+| `claim` | _string_ | Claim is the name of the claim in the session that the value should be<br/>loaded from. Available claims: `access_token` `id_token` `created_at`<br/>`expires_on` `refresh_token` `email` `user` `groups` `preferred_username`. |
 | `prefix` | _string_ | Prefix is an optional prefix that will be prepended to the value of the<br/>claim if it is non-empty. |
 | `basicAuthPassword` | _[SecretSource](#secretsource)_ | BasicAuthPassword converts this claim into a basic auth header.<br/>Note the value of claim will become the basic auth username and the<br/>basicAuthPassword will be used as the password value. |
 
@@ -264,6 +451,97 @@ make up the header value
 | `jwtKeyFile` | _string_ | JWTKeyFile is a path to the private key file in PEM format used to sign the JWT |
 | `pubjwkURL` | _string_ | PubJWKURL is the JWK pubkey access endpoint |
 
+### LoginURLParameter
+
+(**Appears on:** [Provider](#provider))
+
+LoginURLParameter is the configuration for a single query parameter that
+can be passed through from the `/oauth2/start` endpoint to the IdP login
+URL.  The "default" option specifies the default value or values (if any)
+that will be passed to the IdP for this parameter, and "allow" is a list
+of options for ways in which this parameter can be set or overridden via
+the query string to `/oauth2/start`.
+If _only_ a default is specified and no "allow" then the parameter is
+effectively fixed - the default value will always be used and anything
+passed to the start URL will be ignored.  If _only_ "allow" is specified
+but no default then the parameter will only be passed on to the IdP if
+the caller provides it, and no value will be sent otherwise.
+
+Examples:
+
+# A parameter whose value is fixed
+
+```
+name: organization
+default:
+- myorg
+```
+
+A parameter that is not passed by default, but may be set to one of a
+fixed set of values
+
+```
+name: prompt
+allow:
+- value: login
+- value: consent
+- value: select_account
+```
+
+A parameter that is passed by default but may be overridden by one of
+a fixed set of values
+
+```
+name: prompt
+default: ["login"]
+allow:
+- value: consent
+- value: select_account
+```
+
+A parameter that may be overridden, but only by values that match a
+regular expression.  For example to restrict `login_hint` to email
+addresses in your organization's domain:
+
+```
+name: login_hint
+allow:
+- pattern: '^[^@]*@example\.com$'
+# this allows at most one "@" sign, and requires "example.com" domain.
+```
+
+Note that the YAML rules around exactly which characters are allowed
+and/or require escaping in different types of string literals are
+convoluted.  For regular expressions the single quoted form is simplest
+as backslash is not considered to be an escape character.  Alternatively
+use the "chomped block" format `|-`:
+
+```
+  - pattern: |-
+    ^[^@]*@example\.com$
+
+```
+
+The hyphen is important, a `|` block would have a trailing newline
+character.
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `name` | _string_ | Name specifies the name of the query parameter. |
+| `default` | _[]string_ |  _(Optional)_ Default specifies a default value or values that will be<br/>passed to the IdP if not overridden. |
+| `allow` | _[[]URLParameterRule](#urlparameterrule)_ |  _(Optional)_ Allow specifies rules about how the default (if any) may be<br/>overridden via the query string to `/oauth2/start`.  Only<br/>values that match one or more of the allow rules will be<br/>forwarded to the IdP. |
+
+### MicrosoftEntraIDOptions
+
+(**Appears on:** [Provider](#provider))
+
+
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `allowedTenants` | _[]string_ | AllowedTenants is a list of allowed tenants. In case of multi-tenant apps, incoming tokens are<br/>issued by different issuers and OIDC issuer verification needs to be disabled.<br/>When not specified, all tenants are allowed. Redundant for single-tenant apps<br/>(regular ID token validation matches the issuer). |
+| `federatedTokenAuth` | _bool_ | FederatedTokenAuth enable oAuth2 client authentication with federated token projected<br/>by Entra Workload Identity plugin, instead of client secret. |
+
 ### OIDCOptions
 
 (**Appears on:** [Provider](#provider))
@@ -278,9 +556,13 @@ make up the header value
 | `insecureSkipNonce` | _bool_ | InsecureSkipNonce skips verifying the ID Token's nonce claim that must match<br/>the random nonce sent in the initial OAuth flow. Otherwise, the nonce is checked<br/>after the initial OAuth redeem & subsequent token refreshes.<br/>default set to 'true'<br/>Warning: In a future release, this will change to 'false' by default for enhanced security. |
 | `skipDiscovery` | _bool_ | SkipDiscovery allows to skip OIDC discovery and use manually supplied Endpoints<br/>default set to 'false' |
 | `jwksURL` | _string_ | JwksURL is the OpenID Connect JWKS URL<br/>eg: https://www.googleapis.com/oauth2/v3/certs |
+| `publicKeyFiles` | _[]string_ | PublicKeyFiles is a list of paths pointing to public key files in PEM format to use<br/>for verifying JWT tokens |
 | `emailClaim` | _string_ | EmailClaim indicates which claim contains the user email,<br/>default set to 'email' |
 | `groupsClaim` | _string_ | GroupsClaim indicates which claim contains the user groups<br/>default set to 'groups' |
 | `userIDClaim` | _string_ | UserIDClaim indicates which claim contains the user ID<br/>default set to 'email' |
+| `audienceClaims` | _[]string_ | AudienceClaim allows to define any claim that is verified against the client id<br/>By default `aud` claim is used for verification. |
+| `extraAudiences` | _[]string_ | ExtraAudiences is a list of additional audiences that are allowed<br/>to pass verification in addition to the client id. |
+| `enabledSigningAlgs` | _[]string_ | EnabledSigningAlgs is a list of allowed JWT signing algorithms.<br/>When discovery is enabled, the effective set is the intersection<br/>between this list and the provider's discovered supported algorithms.<br/>By default `RS256` is used if nothing has been discovered or specified. |
 
 ### Provider
 
@@ -295,6 +577,7 @@ Provider holds all configuration for a single provider
 | `clientSecretFile` | _string_ | ClientSecretFile is the name of the file<br/>containing the OAuth Client Secret, it will be used if ClientSecret is not set. |
 | `keycloakConfig` | _[KeycloakOptions](#keycloakoptions)_ | KeycloakConfig holds all configurations for Keycloak provider. |
 | `azureConfig` | _[AzureOptions](#azureoptions)_ | AzureConfig holds all configurations for Azure provider. |
+| `microsoftEntraIDConfig` | _[MicrosoftEntraIDOptions](#microsoftentraidoptions)_ | MicrosoftEntraIDConfig holds all configurations for Entra ID provider. |
 | `ADFSConfig` | _[ADFSOptions](#adfsoptions)_ | ADFSConfig holds all configurations for ADFS provider. |
 | `bitbucketConfig` | _[BitbucketOptions](#bitbucketoptions)_ | BitbucketConfig holds all configurations for Bitbucket provider. |
 | `githubConfig` | _[GitHubOptions](#githuboptions)_ | GitHubConfig holds all configurations for GitHubC provider. |
@@ -303,19 +586,33 @@ Provider holds all configuration for a single provider
 | `oidcConfig` | _[OIDCOptions](#oidcoptions)_ | OIDCConfig holds all configurations for OIDC provider<br/>or providers utilize OIDC configurations. |
 | `loginGovConfig` | _[LoginGovOptions](#logingovoptions)_ | LoginGovConfig holds all configurations for LoginGov provider. |
 | `id` | _string_ | ID should be a unique identifier for the provider.<br/>This value is required for all providers. |
-| `provider` | _string_ | Type is the OAuth provider<br/>must be set from the supported providers group,<br/>otherwise 'Google' is set as default |
+| `provider` | _[ProviderType](#providertype)_ | Type is the OAuth provider<br/>must be set from the supported providers group,<br/>otherwise 'Google' is set as default |
 | `name` | _string_ | Name is the providers display name<br/>if set, it will be shown to the users in the login page. |
 | `caFiles` | _[]string_ | CAFiles is a list of paths to CA certificates that should be used when connecting to the provider.<br/>If not specified, the default Go trust sources are used instead |
+| `useSystemTrustStore` | _bool_ | UseSystemTrustStore determines if your custom CA files and the system trust store are used<br/>If set to true, your custom CA files and the system trust store are used otherwise only your custom CA files. |
 | `loginURL` | _string_ | LoginURL is the authentication endpoint |
+| `loginURLParameters` | _[[]LoginURLParameter](#loginurlparameter)_ | LoginURLParameters defines the parameters that can be passed from the start URL to the IdP login URL |
+| `authRequestResponseMode` | _string_ | AuthRequestResponseMode defines the response mode to request during authorization request |
 | `redeemURL` | _string_ | RedeemURL is the token redemption endpoint |
 | `profileURL` | _string_ | ProfileURL is the profile access endpoint |
+| `skipClaimsFromProfileURL` | _bool_ | SkipClaimsFromProfileURL allows to skip request to Profile URL for resolving claims not present in id_token<br/>default set to 'false' |
 | `resource` | _string_ | ProtectedResource is the resource that is protected (Azure AD and ADFS only) |
 | `validateURL` | _string_ | ValidateURL is the access token validation endpoint |
 | `scope` | _string_ | Scope is the OAuth scope specification |
-| `prompt` | _string_ | Prompt is OIDC prompt |
-| `approvalPrompt` | _string_ | ApprovalPrompt is the OAuth approval_prompt<br/>default is set to 'force' |
 | `allowedGroups` | _[]string_ | AllowedGroups is a list of restrict logins to members of this group |
-| `acrValues` | _string_ | AcrValues is a string of acr values |
+| `code_challenge_method` | _string_ | The code challenge method |
+| `additionalClaims` | _[]string_ | Additional claims to be obtained from the upstream IDP, either from the id_token or from the userinfo endpoint if configured. |
+| `backendLogoutURL` | _string_ | URL to call to perform backend logout, `{id_token}` would be replaced by the actual `id_token` if available in the session |
+
+### ProviderType
+#### (`string` alias)
+
+(**Appears on:** [Provider](#provider))
+
+ProviderType is used to enumerate the different provider type options
+Valid options are: adfs, azure, bitbucket, digitalocean facebook, github,
+gitlab, google, keycloak, keycloak-oidc, linkedin, login.gov, nextcloud
+and oidc.
 
 ### Providers
 
@@ -323,8 +620,11 @@ Provider holds all configuration for a single provider
 
 (**Appears on:** [AlphaOptions](#alphaoptions))
 
-Providers is a collection of definitions for providers.
-
+The provider can be selected using the `provider` configuration value, or
+set in the [`providers` array using
+AlphaConfig](https://oauth2-proxy.github.io/oauth2-proxy/configuration/alpha-config#providers).
+However, [**the feature to implement multiple providers is not
+complete**](https://github.com/oauth2-proxy/oauth2-proxy/issues/926).
 
 ### SecretSource
 
@@ -347,9 +647,9 @@ Server represents the configuration for an HTTP(S) server
 
 | Field | Type | Description |
 | ----- | ---- | ----------- |
-| `BindAddress` | _string_ | BindAddress is the address on which to serve traffic.<br/>Leave blank or set to "-" to disable. |
-| `SecureBindAddress` | _string_ | SecureBindAddress is the address on which to serve secure traffic.<br/>Leave blank or set to "-" to disable. |
-| `TLS` | _[TLS](#tls)_ | TLS contains the information for loading the certificate and key for the<br/>secure traffic and further configuration for the TLS server. |
+| `bindAddress` | _string_ | BindAddress is the address on which to serve traffic.<br/>Different types of bind addresses are supported:<br/>* `[http://]<addr>:<port>`<br/>* `fd:<int>` (case insensitive)<br/>* `unix://<path>`<br/>Unix sockets are created with default system umask mode, which can be overridden, e.g.: `unix://my-socket,mode=0777`<br/>Square brackets are required for ipv6 address, e.g. `http://[::1]:4180`<br/>Leave blank or set to "-" to disable. |
+| `secureBindAddress` | _string_ | SecureBindAddress is the address on which to serve secure traffic.<br/>Secure bind addresses need to respond with valid SSL and use the following format:<br/>* `[https://]<addr>:<port>`<br/>Square brackets are required for ipv6 address, e.g. `https://[::1]:4180`<br/>Leave blank or set to "-" to disable. |
+| `tls` | _[TLS](#tls)_ | TLS contains the information for loading the certificate and key for the<br/>secure traffic and further configuration for the TLS server. |
 
 ### TLS
 
@@ -360,9 +660,24 @@ as well as an optional minimal TLS version that is acceptable.
 
 | Field | Type | Description |
 | ----- | ---- | ----------- |
-| `Key` | _[SecretSource](#secretsource)_ | Key is the TLS key data to use.<br/>Typically this will come from a file. |
-| `Cert` | _[SecretSource](#secretsource)_ | Cert is the TLS certificate data to use.<br/>Typically this will come from a file. |
-| `MinVersion` | _string_ | MinVersion is the minimal TLS version that is acceptable.<br/>E.g. Set to "TLS1.3" to select TLS version 1.3 |
+| `key` | _[SecretSource](#secretsource)_ | Key is the TLS key data to use.<br/>Typically this will come from a file. |
+| `cert` | _[SecretSource](#secretsource)_ | Cert is the TLS certificate data to use.<br/>Typically this will come from a file. |
+| `minVersion` | _string_ | MinVersion is the minimal TLS version that is acceptable.<br/>E.g. Set to "TLS1.3" to select TLS version 1.3 |
+| `cipherSuites` | _[]string_ | CipherSuites is a list of TLS cipher suites that are allowed.<br/>E.g.:<br/>- TLS_RSA_WITH_RC4_128_SHA<br/>- TLS_RSA_WITH_AES_256_GCM_SHA384<br/>If not specified, the default Go safe cipher list is used.<br/>List of valid cipher suites can be found in the [crypto/tls documentation](https://pkg.go.dev/crypto/tls#pkg-constants). |
+
+### URLParameterRule
+
+(**Appears on:** [LoginURLParameter](#loginurlparameter))
+
+URLParameterRule represents a rule by which query parameters
+passed to the `/oauth2/start` endpoint are checked to determine whether
+they are valid overrides for the given parameter passed to the IdP's
+login URL.  Either Value or Pattern should be supplied, not both.
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `value` | _string_ | A Value rule matches just this specific value |
+| `pattern` | _string_ | A Pattern rule gives a regular expression that must be matched by<br/>some substring of the value.  The expression is _not_ automatically<br/>anchored to the start and end of the value, if you _want_ to restrict<br/>the whole parameter value you must anchor it yourself with `^` and `$`. |
 
 ### Upstream
 
@@ -374,15 +689,17 @@ Requests will be proxied to this upstream if the path matches the request path.
 | Field | Type | Description |
 | ----- | ---- | ----------- |
 | `id` | _string_ | ID should be a unique identifier for the upstream.<br/>This value is required for all upstreams. |
-| `path` | _string_ | Path is used to map requests to the upstream server.<br/>The closest match will take precedence and all Paths must be unique.<br/>Path can also take a pattern when used with RewriteTarget.<br/>Path segments can be captured and matched using regular experessions.<br/>Eg:<br/>- `^/foo$`: Match only the explicit path `/foo`<br/>- `^/bar/$`: Match any path prefixed with `/bar/`<br/>- `^/baz/(.*)$`: Match any path prefixed with `/baz` and capture the remaining path for use with RewriteTarget |
-| `rewriteTarget` | _string_ | RewriteTarget allows users to rewrite the request path before it is sent to<br/>the upstream server.<br/>Use the Path to capture segments for reuse within the rewrite target.<br/>Eg: With a Path of `^/baz/(.*)`, a RewriteTarget of `/foo/$1` would rewrite<br/>the request `/baz/abc/123` to `/foo/abc/123` before proxying to the<br/>upstream server. |
+| `path` | _string_ | Path is used to map requests to the upstream server.<br/>The closest match will take precedence and all Paths must be unique.<br/>Without RewriteTarget, Path follows gorilla/mux route syntax.<br/>Eg:<br/>- `/foo`: Match only the explicit path `/foo`<br/>- `/bar/`: Match any path prefixed with `/bar/`<br/>- `/baz/{path:.*}`: Match any path prefixed with `/baz/`<br/>When RewriteTarget is set, Path is treated as a regular expression.<br/>Eg: `^/baz/(.*)$` matches any path prefixed with `/baz` and captures the<br/>remaining path for use with RewriteTarget. |
+| `rewriteTarget` | _string_ | RewriteTarget allows users to rewrite the request path before it is sent to<br/>the upstream server (for an HTTP/HTTPS upstream) or mapped to the filesystem<br/>(for a `file:` upstream).<br/>Use the Path to capture segments for reuse within the rewrite target.<br/>Eg: With a Path of `^/baz/(.*)`, a RewriteTarget of `/foo/$1` would rewrite<br/>the request `/baz/abc/123` to `/foo/abc/123` before proxying to the<br/>upstream server.  Or if the upstream were `file:///app`, a request for<br/>`/baz/info.html` would return the contents of the file `/app/foo/info.html`. |
 | `uri` | _string_ | The URI of the upstream server. This may be an HTTP(S) server of a File<br/>based URL. It may include a path, in which case all requests will be served<br/>under that path.<br/>Eg:<br/>- http://localhost:8080<br/>- https://service.localhost<br/>- https://service.localhost/path<br/>- file://host/path<br/>If the URI's path is "/base" and the incoming request was for "/dir",<br/>the upstream request will be for "/base/dir". |
-| `insecureSkipTLSVerify` | _bool_ | InsecureSkipTLSVerify will skip TLS verification of upstream HTTPS hosts.<br/>This option is insecure and will allow potential Man-In-The-Middle attacks<br/>betweem OAuth2 Proxy and the usptream server.<br/>Defaults to false. |
+| `insecureSkipTLSVerify` | _bool_ | InsecureSkipTLSVerify will skip TLS verification of upstream HTTPS hosts.<br/>This option is insecure and will allow potential Man-In-The-Middle attacks<br/>between OAuth2 Proxy and the upstream server.<br/>Defaults to false. |
 | `static` | _bool_ | Static will make all requests to this upstream have a static response.<br/>The response will have a body of "Authenticated" and a response code<br/>matching StaticCode.<br/>If StaticCode is not set, the response will return a 200 response. |
 | `staticCode` | _int_ | StaticCode determines the response code for the Static response.<br/>This option can only be used with Static enabled. |
-| `flushInterval` | _[Duration](#duration)_ | FlushInterval is the period between flushing the response buffer when<br/>streaming response from the upstream.<br/>Defaults to 1 second. |
+| `flushInterval` | _duration_ | FlushInterval is the period between flushing the response buffer when<br/>streaming response from the upstream.<br/>Defaults to 1 second. |
 | `passHostHeader` | _bool_ | PassHostHeader determines whether the request host header should be proxied<br/>to the upstream server.<br/>Defaults to true. |
 | `proxyWebSockets` | _bool_ | ProxyWebSockets enables proxying of websockets to upstream servers<br/>Defaults to true. |
+| `timeout` | _duration_ | Timeout is the maximum duration the server will wait for a response from the upstream server.<br/>Defaults to 30 seconds. |
+| `disableKeepAlives` | _bool_ | DisableKeepAlives disables HTTP keep-alive connections to the upstream server.<br/>Defaults to false. |
 
 ### UpstreamConfig
 
@@ -392,5 +709,5 @@ UpstreamConfig is a collection of definitions for upstream servers.
 
 | Field | Type | Description |
 | ----- | ---- | ----------- |
-| `proxyRawPath` | _bool_ | ProxyRawPath will pass the raw url path to upstream allowing for url's<br/>like: "/%2F/" which would otherwise be redirected to "/" |
+| `proxyRawPath` | _bool_ | ProxyRawPath will pass the raw url path to upstream allowing for urls<br/>like: "/%2F/" which would otherwise be redirected to "/" |
 | `upstreams` | _[[]Upstream](#upstream)_ | Upstreams represents the configuration for the upstream servers.<br/>Requests will be proxied to this upstream if the path matches the request path. |
